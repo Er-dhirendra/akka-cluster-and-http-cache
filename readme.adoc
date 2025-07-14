@@ -584,3 +584,74 @@ name := "akka-cluster-and-http-cache",
     )
   )
 ----
+
+=== Akka Cluster Cache System
+:toc: left
+:icons: font
+
+A distributed cache system built with Akka Cluster Sharding, Akka HTTP, and CRDTs (LWWMap). This system supports `PUT`, `GET`, and `DELETE` operations across a cluster with eventual consistency.
+
+==== Data Replication
+
+Data is replicated internally using Akka Distributed Data's `LWWMap`, a Last-Write-Wins (LWW) Conflict-free Replicated Data Type (CRDT). Each update is tagged with a timestamp and the node's unique address to resolve conflicts.
+
+==== PUT Operation Flow
+
+[plantuml, put-flow, svg]
+----
+@startuml
+actor Client
+participant "HTTP Server" as Http
+participant "CacheActor (Sharded)" as Actor
+participant "LWWMap (Replicator)" as Map
+
+Client -> Http: PUT /cache/foo { "bar" }
+Http -> Actor: Put("foo", "bar")
+Actor -> Map: .put("foo", "bar")
+Map --> Actor: UpdateSuccess
+Actor --> Http: HTTP 200 OK
+@enduml
+----
+
+==== GET Operation Flow
+
+[plantuml, get-flow, svg]
+----
+@startuml
+actor Client
+participant "HTTP Server" as Http
+participant "CacheActor (Sharded)" as Actor
+participant "LWWMap (Replicator)" as Map
+
+Client -> Http: GET /cache/foo
+Http -> Actor: Get("foo")
+Actor -> Map: .get("foo")
+Map --> Actor: GetSuccess with value
+Actor --> Http: HTTP 200 OK with value
+@enduml
+----
+
+==== If Key Not Found:
+[source,text]
+-----
+Map returns NotFound or GetSuccess with None
+→ Actor returns 404 Not Found
+-----
+
+==== DELETE Operation Flow
+
+[plantuml, delete-flow, svg]
+----
+@startuml
+actor Client
+participant "HTTP Server" as Http
+participant "CacheActor (Sharded)" as Actor
+participant "LWWMap (Replicator)" as Map
+
+Client -> Http: DELETE /cache/foo
+Http -> Actor: Delete("foo")
+Actor -> Map: .remove("foo")
+Map --> Actor: UpdateSuccess
+Actor --> Http: HTTP 200 OK
+@enduml
+----
