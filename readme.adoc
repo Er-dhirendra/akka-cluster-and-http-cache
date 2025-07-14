@@ -1,0 +1,586 @@
+
+
+
+= Akka Cluster Distributed Cache Service
+
+This project is a simple distributed cache system built using Akka Typed, Akka Cluster Sharding, and Akka Distributed Data. It exposes a REST ful HTTP API using Akka HTTP and supports basic `GET`, `PUT`, and `DELETE` operations on a sharded key-value store.
+
+== Features
+
+- Distributed cache using Akka Cluster
+- Automatic sharding with Akka Cluster Sharding
+- Conflict-free replicated data types (CRDTs) via Akka Distributed Data
+- HTTP interface to interact with the cache
+- Logging for observability
+- Cluster event monitoring
+
+== Tech Stack
+
+- Scala 2.13
+- Akka 2.8.x (Typed API)
+- Akka Cluster Sharding
+- Akka Distributed Data
+- Akka HTTP
+- sbt
+- Spray JSON for serialization
+
+== Getting Started
+
+=== Prerequisites
+
+- Java 11+
+- sbt
+
+=== Running Locally
+
+You can start multiple cluster nodes by running the following commands in separate terminals:
+Provide a port number when prompted (e.g., `2551`, `2552`, etc. Alternatively, you can run it with a port argument:
+
+[source,bash]
+----
+sbt "runMain com.cluster.ClusterApplication 2551"
+sbt "runMain com.cluster.ClusterApplication 2552"
+sbt "runMain com.cluster.ClusterApplication 0"
+----
+
+Once the cluster is formed, start the HTTP server:
+
+[source,bash]
+----
+sbt "runMain com.AkkaHttpTypedClient"
+----
+
+The HTTP server will start on `http://localhost:8080`.
+
+== REST API
+
+=== PUT /cache/++{key}++
+
+Stores a value under the specified key.
+
+Example:
+
+[source,bash]
+----
+curl -X PUT http://localhost:8080/cache/myKey \
+     -H "Content-Type: application/json" \
+     -d '{"value":"myValue"}'
+----
+
+=== GET /cache/++{key}++
+
+Fetches the value for a key.
+
+[source,bash]
+----
+curl http://localhost:8080/cache/myKey
+----
+
+=== DELETE /cache/++{key}++
+
+Deletes the specified key.
+
+[source,bash]
+----
+curl -X DELETE http://localhost:8080/cache/myKey
+----
+
+=== Health Check
+
+[source,bash]
+----
+curl http://localhost:8080/health
+----
+
+== Logging
+
+* HTTP requests are logged via `system.log` inside `CacheRoutes`.
+* Cache actor operations log actions such as `PUT`, `GET`, `DELETE`.
+* Cluster lifecycle and reachability events are logged by `ClusterLogger`.
+
+== Cluster Behavior
+
+* Each cache key is routed to a specific shard/entity.
+* Data is replicated using Akka's `LWWMap` CRDT (last-write-wins).
+* Cluster membership and node reachability events are tracked.
+
+== Code Structure
+
+* `com.cache.CacheActor`: Main actor handling data operations.
+* `com.ClusterApplication`: Main entry point to start a cluster node.
+* `com.ClusterLogger`: Actor subscribing to cluster events.
+* `com.CacheRoutes`: Akka HTTP routes.
+* `com.AkkaHttpTypedClient`: Launches the HTTP API and joins cluster.
+
+=== CacheActor
+[source,scala]
+----
+package com.cache
+
+import akka.actor.typed.{ActorRef, Behavior}
+import akka.actor.typed.scaladsl.Behaviors
+import akka.cluster.ddata.{LWWMap, LWWMapKey, SelfUniqueAddress}
+import akka.cluster.ddata.typed.scaladsl.{DistributedData, Replicator, ReplicatorMessageAdapter}
+import com.utils.CborSerializable
+import akka.cluster.sharding.typed.scaladsl.EntityTypeKey
+
+object CacheActor {
+
+  val TypeKey: EntityTypeKey[CacheActor.Command] =
+    EntityTypeKey[CacheActor.Command]("CacheActor")
+
+  // Commands
+  sealed trait Command extends CborSerializable
+
+  final case class Put(key: String, value: String, replyTo: ActorRef[Response]) extends Command
+
+  final case class Get(key: String, replyTo: ActorRef[Response]) extends Command
+
+  final case class Delete(key: String, replyTo: ActorRef[Response]) extends Command
+
+  // Responses
+  sealed trait Response extends CborSerializable
+
+  final case class ValueFound(value: String) extends Response
+
+  case object ValueNotFound extends Response
+
+  case object PutSuccess extends Response
+
+  case object DeleteSuccess extends Response
+
+  // Internal protocol
+  private sealed trait InternalCommand extends Command
+
+  private final case class InternalGetResponse(key: String, replyTo: ActorRef[Response], rsp: Replicator.GetResponse[LWWMap[String, String]]) extends InternalCommand
+
+  private final case class InternalUpdateResponse(replyTo: ActorRef[Response], rsp: Replicator.UpdateResponse[LWWMap[String, String]], success: Response) extends InternalCommand
+
+  private val DataKey: LWWMapKey[String, String] = LWWMapKey("cache")
+
+  def apply(): Behavior[Command] = Behaviors.setup { context =>
+    implicit val node: SelfUniqueAddress = DistributedData(context.system).selfUniqueAddress
+
+    DistributedData.withReplicatorMessageAdapter[Command, LWWMap[String, String]] { replicatorAdapter =>
+      Behaviors.receiveMessage {
+
+        case Put(key, value, replyTo) =>
+          context.log.info(s"[PUT] Request received for key: $key, value: $value")
+          replicatorAdapter.askUpdate(
+            askReplyTo =>
+              Replicator.Update(DataKey, LWWMap.empty[String, String], Replicator.WriteLocal, askReplyTo)(
+                _.put(node, key, value)
+              ),
+            rsp => InternalUpdateResponse(replyTo, rsp, PutSuccess)
+          )
+          Behaviors.same
+
+        case Delete(key, replyTo) =>
+          context.log.info(s"[DELETE] Request received for key: $key")
+          replicatorAdapter.askUpdate(
+            askReplyTo =>
+              Replicator.Update(DataKey, LWWMap.empty[String, String], Replicator.WriteLocal, askReplyTo)(
+                _.remove(node, key)
+              ),
+            rsp => InternalUpdateResponse(replyTo, rsp, DeleteSuccess)
+          )
+
+          Behaviors.same
+
+        case Get(key, replyTo) =>
+          context.log.info(s"[GET] Request received for key: $key")
+          replicatorAdapter.askGet(
+            askReplyTo => Replicator.Get(DataKey, Replicator.ReadLocal, askReplyTo),
+            rsp => InternalGetResponse(key, replyTo, rsp)
+          )
+          Behaviors.same
+
+        case InternalGetResponse(key, replyTo, rsp) =>
+          rsp match {
+            case g@Replicator.GetSuccess(`DataKey`) =>
+              val valueOpt = g.get(DataKey).get(key)
+              valueOpt match {
+                case Some(value) =>
+                  context.log.info(s"[GET] Found key: $key with value: $value")
+                  replyTo ! ValueFound(value)
+                case None =>
+                  context.log.info(s"[GET] Key not found: $key")
+                  replyTo ! ValueNotFound
+              }
+            case Replicator.NotFound(`DataKey`) =>
+              context.log.info(s"[GET] DataKey not found for key: $key")
+              replyTo ! ValueNotFound
+            case _: Replicator.GetFailure[_] =>
+              context.log.warn(s"[GET] Get failure for key: $key")
+              replyTo ! ValueNotFound
+
+            case unknown =>
+              context.log.warn(s"Unhandled GetResponse: $unknown for key: $key")
+              replyTo ! ValueNotFound
+          }
+          Behaviors.same
+
+        case InternalUpdateResponse(replyTo, _: Replicator.UpdateSuccess[_], successReply) =>
+          context.log.info(s"[UPDATE] Successful update, replying with: $successReply")
+          replyTo ! successReply
+          Behaviors.same
+
+        case InternalUpdateResponse(replyTo, _: Replicator.UpdateFailure[_], _) =>
+          context.log.error("[UPDATE] Update failed")
+          replyTo ! ValueNotFound
+          Behaviors.same
+
+        case InternalUpdateResponse(replyTo, other, _) =>
+          context.log.warn(s"Unhandled UpdateResponse: $other")
+          replyTo ! ValueNotFound
+          Behaviors.same
+      }
+    }
+  }
+}
+
+----
+
+=== ClusterApplication
+[source,scala]
+----
+package com.cluster
+
+import akka.actor.typed.scaladsl.Behaviors
+import akka.actor.typed.{ActorSystem, Behavior}
+import akka.cluster.sharding.typed.scaladsl.{ClusterSharding, Entity}
+import com.cache.CacheActor
+import com.typesafe.config.ConfigFactory
+
+import scala.concurrent.Await
+import scala.concurrent.duration.Duration
+
+object ClusterApplication {
+
+  private object RootBehavior {
+    def apply(): Behavior[Nothing] = Behaviors.setup[Nothing] { context =>
+      val log = context.log
+      log.info("Cluster node is starting up...")
+
+      // Spawn optional logger actor (if you have one)
+      context.spawn(ClusterLogger(), "ClusterLogger")
+
+      // Initialize Cluster Sharding
+      val sharding = ClusterSharding(context.system)
+      log.info("Initializing Cluster Sharding for CacheActor")
+
+      sharding.init(
+        Entity(CacheActor.TypeKey) { entityContext =>
+          log.info(s"Starting CacheActor entity: ${entityContext.entityId}")
+          CacheActor()
+        }
+      )
+
+      log.info("Cluster Sharding initialized successfully.")
+      Behaviors.same
+    }
+  }
+
+  def main(args: Array[String]): Unit = {
+    val port =
+      if (args.nonEmpty) args(0).toInt
+      else throw new IllegalArgumentException("Port number must be passed as a command-line argument")
+
+    val config = ConfigFactory.parseString(
+      s"akka.remote.artery.canonical.port = $port"
+    ).withFallback(ConfigFactory.load("application.conf"))
+
+    println(s"Starting ClusterApplication on port $port...")
+
+    val system = ActorSystem[Nothing](RootBehavior(), "cluster-test", config)
+
+    println(s"ClusterApplication started on port $port with system: ${system.name}")
+    Await.result(system.whenTerminated, Duration.Inf)
+  }
+}
+----
+
+=== ClusterLogger
+[source,scala]
+----
+package com.cluster
+
+import akka.actor.typed.{ActorRef, Behavior}
+import akka.actor.typed.scaladsl.Behaviors
+import akka.cluster.ClusterEvent._
+import akka.cluster.typed.{Cluster, Subscribe, Unsubscribe}
+
+object ClusterLogger {
+
+  sealed trait Event
+
+  // Internal adapted cluster events
+  private final case class ReachabilityChange(event: ReachabilityEvent) extends Event
+  private final case class MemberChange(event: MemberEvent) extends Event
+
+  def apply(): Behavior[Event] = Behaviors.setup { ctx =>
+    val cluster = Cluster(ctx.system)
+
+    val memberEventAdapter: ActorRef[MemberEvent] =
+      ctx.messageAdapter(MemberChange.apply)
+    cluster.subscriptions ! Subscribe(memberEventAdapter, classOf[MemberEvent])
+
+    val reachabilityAdapter: ActorRef[ReachabilityEvent] =
+      ctx.messageAdapter(ReachabilityChange.apply)
+    cluster.subscriptions ! Subscribe(reachabilityAdapter, classOf[ReachabilityEvent])
+
+    Behaviors
+      .receiveMessage[Event] {
+        case ReachabilityChange(UnreachableMember(member)) =>
+          ctx.log.info("Member detected as unreachable: {}", member)
+          Behaviors.same
+
+        case ReachabilityChange(ReachableMember(member)) =>
+          ctx.log.info("Member back to reachable: {}", member)
+          Behaviors.same
+
+        case MemberChange(MemberUp(member)) =>
+          ctx.log.info("Member is Up: {}", member.address)
+          Behaviors.same
+
+        case MemberChange(MemberRemoved(member, previousStatus)) =>
+          ctx.log.info("Member is Removed: {} after {}", member.address, previousStatus)
+          Behaviors.same
+
+        case MemberChange(_: MemberEvent) =>
+          // Other member events can be ignored
+          Behaviors.same
+      }
+      .receiveSignal {
+        case (ctx, akka.actor.typed.PostStop) =>
+          cluster.subscriptions ! Unsubscribe(memberEventAdapter)
+          cluster.subscriptions ! Unsubscribe(reachabilityAdapter)
+          ctx.log.info("Unsubscribed from cluster events on stop.")
+          Behaviors.same
+      }
+  }
+}
+----
+
+=== AkkaHttpTypedClient
+[source,scala]
+----
+package com
+
+import akka.actor.typed.scaladsl.Behaviors
+import akka.actor.typed.{ActorSystem, Scheduler}
+import akka.cluster.sharding.typed.scaladsl.{ClusterSharding, EntityRef}
+import akka.http.scaladsl.Http
+import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
+import akka.http.scaladsl.model.StatusCodes
+import akka.http.scaladsl.server.{Directives, Route}
+import akka.util.Timeout
+import com.cache.CacheActor
+import com.typesafe.config.ConfigFactory
+import spray.json.{DefaultJsonProtocol, RootJsonFormat}
+
+import scala.concurrent.duration._
+import scala.concurrent.{Await, ExecutionContext}
+
+// ----- JSON Marshalling -----
+final case class PutRequest(value: String)
+object JsonFormats extends DefaultJsonProtocol {
+  implicit val putRequestFormat: RootJsonFormat[PutRequest] = jsonFormat1(PutRequest)
+}
+
+// ----- Cache HTTP API -----
+class CacheRoutes(
+                   system: ActorSystem[_],
+                   sharding: ClusterSharding
+                 )(implicit timeout: Timeout, ec: ExecutionContext, scheduler: Scheduler)
+  extends Directives {
+
+  import JsonFormats._
+
+  private val log = system.log
+
+  val health: Route =
+    path("health") {
+      get {
+        log.debug("Received health check request")
+        complete(StatusCodes.OK)
+      }
+    }
+
+  val cache: Route =
+    pathPrefix("cache" / Segment) { key =>
+      val entityRef: EntityRef[CacheActor.Command] = sharding.entityRefFor(CacheActor.TypeKey, key)
+
+      concat(
+        put {
+          entity(as[PutRequest]) { body =>
+            log.info(s"PUT request received for key: $key with value: ${body.value}")
+            entityRef ! CacheActor.Put(key, body.value, system.ignoreRef)
+            complete(StatusCodes.OK -> s"Put request for key=$key stored")
+          }
+        },
+        get {
+          log.info(s"GET request received for key: $key")
+          val responseFut = entityRef.ask(replyTo => CacheActor.Get(key, replyTo))
+          onSuccess(responseFut) {
+            case CacheActor.ValueFound(value) =>
+              log.info(s"GET success for key=$key, value=$value")
+              complete(StatusCodes.OK -> value)
+            case CacheActor.ValueNotFound =>
+              log.warn(s"GET key not found: $key")
+              complete(StatusCodes.NotFound -> s"No value for key $key")
+            case unexpected =>
+              log.error(s"Unexpected GET response for key=$key: $unexpected")
+              complete(StatusCodes.InternalServerError)
+          }
+        },
+        delete {
+          log.info(s"DELETE request received for key: $key")
+          entityRef ! CacheActor.Delete(key, system.ignoreRef)
+          complete(StatusCodes.OK -> s"Delete request sent for key=$key")
+        }
+      )
+    }
+
+  val routes: Route = health ~ cache
+}
+
+object AkkaHttpTypedClient {
+  def main(args: Array[String]): Unit = {
+    val config = ConfigFactory.load("application.conf")
+
+    implicit val system: ActorSystem[Any] = ActorSystem(Behaviors.empty[Any], "cluster-test", config)
+    implicit val ec: ExecutionContext = system.executionContext
+    implicit val scheduler: Scheduler = system.scheduler
+    implicit val timeout: Timeout = 5.seconds
+    val log = system.log
+
+    log.info("Starting Akka HTTP Cluster Client...")
+
+    val sharding = ClusterSharding(system)
+
+    log.info("Initializing cluster sharding for CacheActor...")
+    sharding.init(
+      akka.cluster.sharding.typed.scaladsl.Entity(CacheActor.TypeKey)(_ => CacheActor())
+    )
+    log.info("Cluster sharding for CacheActor initialized.")
+
+    val routes = new CacheRoutes(system, sharding)
+
+    Http().newServerAt("0.0.0.0", 8080).bind(routes.routes)
+    log.info("🚀 Server started on http://localhost:8080")
+
+    Await.result(system.whenTerminated, Duration.Inf)
+  }
+}
+----
+
+=== CborSerializable
+
+[source,scala]
+----
+package com.utils
+
+trait CborSerializable {
+}
+
+----
+
+=== build.sbt
+[source,HOCON]
+----
+akka {
+  actor {
+    provider = cluster
+    serialize-messages = on
+    serialization-bindings {
+      "com.utils.CborSerializable" = jackson-cbor
+    }
+  }
+  serialization.jackson {
+    cbor {
+      enabled = on
+    }
+  }
+  remote {
+    artery {
+      enabled = on
+      transport = tcp
+      canonical-hostname = "127.0.0.1"
+    }
+  }
+
+  cluster {
+    seed-nodes = [
+      "akka://cluster-test@127.0.0.1:2551",
+      "akka://cluster-test@127.0.0.1:2552"
+    ]
+    downing-provider-class = "akka.cluster.sbr.SplitBrainResolverProvider"
+  }
+
+  cluster.sharding {
+    number-of-shards = 100
+  }
+}
+
+http {
+  ip = ${?SERVER_IP}
+  ip = ${http.ip}        // fallback to default below
+  ip = "127.0.0.1"
+
+  port = ${?SERVER_PORT}
+  port = ${http.port}
+  port = 8000
+}
+----
+
+
+=== application.conf
+[source,SBT]
+----
+import scala.collection.Seq
+
+// Global project settings
+ThisBuild / version := "0.1.0-SNAPSHOT"
+ThisBuild / scalaVersion := "2.13.12"
+
+// Dependency versions
+val AkkaVersion             = "2.8.8"
+val AkkaHttpVersion         = "10.2.7"
+val AkkaDiagnosticsVersion  = "2.0.1"
+val LogbackClassicVersion   = "1.5.18"
+val ScalaTestVersion        = "3.2.17"
+val MUnitVersion            = "1.0.0-M10"
+val JacksonSupportVersion   = "1.39.2"
+
+lazy val root = (project in file("."))
+.settings(
+name := "akka-cluster-and-http-cache",
+
+    libraryDependencies ++= Seq(
+      // Akka core & cluster
+      "com.typesafe.akka" %% "akka-actor-typed"           % AkkaVersion,
+      "com.typesafe.akka" %% "akka-cluster-typed"         % AkkaVersion,
+      "com.typesafe.akka" %% "akka-serialization-jackson" % AkkaVersion,
+
+      // Akka HTTP core
+      "com.typesafe.akka" %% "akka-http"                  % AkkaHttpVersion,
+      "com.typesafe.akka" %% "akka-http-spray-json"       % AkkaHttpVersion,
+      "de.heikoseeberger" %% "akka-http-jackson"          % JacksonSupportVersion,
+
+      // Logging
+      "ch.qos.logback"     % "logback-classic"            % LogbackClassicVersion,
+
+      // Sharding dependencies
+      "com.typesafe.akka" %% "akka-cluster-sharding-typed" % AkkaVersion,
+      "com.typesafe.akka" %% "akka-cluster-tools" % AkkaVersion,
+
+      // Test dependencies
+      "org.scalatest"             %% "scalatest"               % ScalaTestVersion % Test,
+      "org.scalameta"             %% "munit"                   % MUnitVersion     % Test,
+      "com.typesafe.akka"         %% "akka-http-testkit"       % AkkaHttpVersion  % Test,
+      "com.typesafe.akka"         %% "akka-actor-testkit-typed" % AkkaVersion     % Test,
+      "com.typesafe.akka"         %% "akka-multi-node-testkit"  % AkkaVersion     % Test
+    )
+  )
+----
