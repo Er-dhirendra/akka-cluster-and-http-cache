@@ -31,8 +31,9 @@ lazy val root = (project in file("."))
       // Logging
       "ch.qos.logback"     % "logback-classic"            % LogbackClassicVersion,
 
-      // Diagnostics
-      "com.lightbend.akka" %% "akka-diagnostics"          % AkkaDiagnosticsVersion,
+      // Sharding dependencies
+      "com.typesafe.akka" %% "akka-cluster-sharding-typed" % AkkaVersion,
+      "com.typesafe.akka" %% "akka-cluster-tools" % AkkaVersion,
 
       // Test dependencies
       "org.scalatest"             %% "scalatest"               % ScalaTestVersion % Test,
